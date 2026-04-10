@@ -2,6 +2,7 @@
 import io
 import re
 from datetime import datetime
+import os
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -12,7 +13,64 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+import matplotlib.pyplot as plt
+
+
+def check_password() -> bool:
+    configured_password = st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "")).strip()
+    if not configured_password:
+        return True
+
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.markdown(
+        """
+        <style>
+            .login-wrap {
+                max-width: 520px;
+                margin: 4rem auto 1rem auto;
+                padding: 2rem;
+                border-radius: 24px;
+                border: 1px solid rgba(99, 102, 241, 0.25);
+                background: linear-gradient(180deg, rgba(15,23,42,0.96), rgba(30,41,59,0.96));
+                color: white;
+                box-shadow: 0 20px 50px rgba(2, 6, 23, 0.25);
+            }
+            .login-badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 56px;
+                height: 56px;
+                border-radius: 18px;
+                background: linear-gradient(135deg, #2563eb, #7c3aed);
+                font-weight: 700;
+                font-size: 1.1rem;
+                margin-bottom: 1rem;
+            }
+        </style>
+        <div class="login-wrap">
+            <div class="login-badge">RDF</div>
+            <h2 style="margin:0 0 0.5rem 0;">Accès protégé</h2>
+            <p style="margin:0 0 1rem 0; opacity:0.9;">
+                Entre le mot de passe pour ouvrir le tableau de bord d'analyse RDF.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    pwd = st.text_input("Mot de passe", type="password", key="pwd_input")
+    if st.button("Se connecter", type="primary", use_container_width=True):
+        if pwd == configured_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Mot de passe incorrect.")
+    st.stop()
+
 
 TARGET_REASONS = [
     "RDF DESSERT",
@@ -361,6 +419,77 @@ def df_to_table_data(df: pd.DataFrame, max_rows: int = 35) -> List[List[str]]:
     return [list(export_df.columns)] + export_df.values.tolist()
 
 
+
+
+def build_chart_image(df: pd.DataFrame, chart_type: str):
+    if df is None or df.empty:
+        return None
+
+    plt.close("all")
+    fig, ax = plt.subplots(figsize=(10.5, 4.6))
+
+    if chart_type == "excel_people":
+        chart_df = df.copy()
+        chart_df["DATE_JOUR"] = pd.to_datetime(chart_df["DATE_JOUR"]).dt.strftime("%Y-%m-%d")
+        pivot = chart_df.pivot_table(
+            index="DATE_JOUR",
+            columns="LOT_LABEL",
+            values="NB_PERSONNES",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        pivot.plot(kind="bar", stacked=True, ax=ax)
+        ax.set_title("Répartition des personnes par jour - Excel")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Personnes")
+        ax.legend(title="Lot", fontsize=8, title_fontsize=9)
+    elif chart_type == "html_people":
+        chart_df = df.copy()
+        chart_df["DATE_TICKET"] = pd.to_datetime(chart_df["DATE_TICKET"]).dt.strftime("%Y-%m-%d")
+        ax.bar(chart_df["DATE_TICKET"], chart_df["PERSONNES_RESTAURANT"])
+        ax.set_title("Personnes par jour en restaurant - tickets HTML RDF")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Personnes")
+    elif chart_type == "discounts":
+        chart_df = df.copy()
+        ax.bar(chart_df["reason"], chart_df["montant_total_remises"])
+        ax.set_title("Montant des remises par type RDF")
+        ax.set_xlabel("Type RDF")
+        ax.set_ylabel("Montant remises (€)")
+    elif chart_type == "reconciliation":
+        chart_df = df.copy()
+        chart_df["date"] = pd.to_datetime(chart_df["date"]).dt.strftime("%Y-%m-%d")
+        pivot = chart_df.pivot_table(
+            index="date",
+            columns="reason",
+            values="ecart",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        pivot.plot(kind="bar", ax=ax)
+        ax.set_title("Écart entre attendu et trouvé")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Écart")
+        ax.legend(title="Type RDF", fontsize=8, title_fontsize=9)
+    else:
+        plt.close(fig)
+        return None
+
+    ax.tick_params(axis="x", rotation=35)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer
+
+
+def pdf_chart_element(image_buffer, width_cm: float = 24.5, height_cm: float = 10.5):
+    if image_buffer is None:
+        return None
+    return Image(image_buffer, width=width_cm * cm, height=height_cm * cm)
+
 def styled_pdf_table(data: List[List[str]], col_widths=None) -> Table:
     table = Table(data, colWidths=col_widths, repeatRows=1 if len(data) > 1 else 0)
     style = TableStyle([
@@ -390,6 +519,7 @@ def build_pdf_report(
     discount_summary: pd.DataFrame,
     reconciliation: pd.DataFrame,
     selected_sources: List[str],
+    daily_lot: pd.DataFrame | None = None,
 ) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -436,6 +566,11 @@ def build_pdf_report(
 
     source_label = ", ".join(selected_sources) if selected_sources else "Tous les fichiers HTML"
 
+    excel_people_chart = pdf_chart_element(build_chart_image(daily_lot if daily_lot is not None else pd.DataFrame(), "excel_people"))
+    html_people_chart = pdf_chart_element(build_chart_image(html_covers_daily, "html_people"))
+    discounts_chart = pdf_chart_element(build_chart_image(discount_summary, "discounts"))
+    reconciliation_chart = pdf_chart_element(build_chart_image(reconciliation, "reconciliation"))
+
     story = [
         Paragraph("Rapport Analyse RDF Flams", title_style),
         Spacer(1, 0.15 * cm),
@@ -450,22 +585,46 @@ def build_pdf_report(
         Spacer(1, 0.25 * cm),
         Paragraph("Synthèse des remises RDF", h_style),
         styled_pdf_table(df_to_table_data(discount_summary), col_widths=[5 * cm, 2.2 * cm, 3.4 * cm, 2.2 * cm, 3.8 * cm, 2.5 * cm]),
+    ]
+
+    if discounts_chart is not None:
+        story.extend([Spacer(1, 0.15 * cm), discounts_chart])
+
+    story.extend([
         Spacer(1, 0.3 * cm),
         Paragraph("Personnes par jour et par lot - fichier Excel", h_style),
         styled_pdf_table(df_to_table_data(daily_pivot), col_widths=None),
+    ])
+
+    if excel_people_chart is not None:
+        story.extend([Spacer(1, 0.15 * cm), excel_people_chart])
+
+    story.extend([
         Spacer(1, 0.3 * cm),
         Paragraph("Personnes par jour en restaurant - tickets HTML RDF", h_style),
-        styled_pdf_table(df_to_table_data(html_covers_daily), col_widths=[4 * cm, 4.5 * cm]),
-        PageBreak(),
+        styled_pdf_table(df_to_table_data(html_covers_daily), col_widths=[4 * cm, 4 * cm]),
+    ])
+
+    if html_people_chart is not None:
+        story.extend([Spacer(1, 0.15 * cm), html_people_chart])
+
+    story.extend([
+        Spacer(1, 0.3 * cm),
         Paragraph("Contrôle attendu vs trouvé", h_style),
         styled_pdf_table(df_to_table_data(reconciliation), col_widths=None),
+    ])
+
+    if reconciliation_chart is not None:
+        story.extend([Spacer(1, 0.15 * cm), reconciliation_chart])
+
+    story.extend([
+        PageBreak(),
+        Paragraph("Détail des remises RDF", h_style),
+        styled_pdf_table(df_to_table_data(df_discounts.sort_values(["date", "note_number", "reason"]), max_rows=80), col_widths=None),
         Spacer(1, 0.3 * cm),
         Paragraph("Tickets RDF", h_style),
-        styled_pdf_table(df_to_table_data(df_tickets.sort_values(["date", "note_number"])), col_widths=None),
-        Spacer(1, 0.3 * cm),
-        Paragraph("Détails des remises RDF", h_style),
-        styled_pdf_table(df_to_table_data(df_discounts.sort_values(["date", "note_number", "reason"])), col_widths=None),
-    ]
+        styled_pdf_table(df_to_table_data(df_tickets.sort_values(["date", "note_number"]), max_rows=80), col_widths=None),
+    ])
 
     doc.build(story)
     buffer.seek(0)
@@ -521,27 +680,74 @@ def render_header():
         """
         <style>
             .block-container {
-                padding-top: 1.2rem;
-                padding-bottom: 2rem;
+                padding-top: 1rem;
+                padding-bottom: 2.2rem;
+                max-width: 1450px;
             }
-            .main-card {
-                background: linear-gradient(135deg, rgba(15, 23, 42, 0.96) 0%, rgba(30, 41, 59, 0.96) 100%);
+            [data-testid="stSidebar"] {
+                border-right: 1px solid rgba(148, 163, 184, 0.16);
+            }
+            .hero-card {
+                position: relative;
+                overflow: hidden;
+                background:
+                    radial-gradient(circle at top right, rgba(59, 130, 246, 0.30), transparent 28%),
+                    radial-gradient(circle at left bottom, rgba(168, 85, 247, 0.24), transparent 24%),
+                    linear-gradient(135deg, rgba(15, 23, 42, 0.98) 0%, rgba(30, 41, 59, 0.98) 100%);
                 color: #ffffff;
-                padding: 1.35rem 1.5rem;
-                border-radius: 18px;
+                padding: 1.5rem 1.6rem;
+                border-radius: 22px;
                 margin-bottom: 1rem;
-                border: 1px solid rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.09);
+                box-shadow: 0 18px 45px rgba(15, 23, 42, 0.18);
             }
-            .subtle {
-                color: rgba(255,255,255,0.86);
-                margin-top: 0.35rem;
-                font-size: 0.95rem;
+            .hero-flex {
+                display: flex;
+                align-items: center;
+                gap: 1rem;
+                flex-wrap: wrap;
+            }
+            .hero-logo {
+                width: 64px;
+                height: 64px;
+                border-radius: 20px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%);
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                font-size: 1.1rem;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
+            }
+            .hero-title {
+                margin: 0;
+                font-size: 2rem;
+                line-height: 1.1;
+            }
+            .hero-subtle {
+                color: rgba(255,255,255,0.88);
+                margin-top: 0.4rem;
+                font-size: 0.97rem;
+                max-width: 980px;
+            }
+            .hero-chip {
+                display: inline-block;
+                margin-top: 0.7rem;
+                padding: 0.35rem 0.7rem;
+                border-radius: 999px;
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.10);
+                color: rgba(255,255,255,0.92);
+                font-size: 0.82rem;
+                margin-right: 0.35rem;
             }
             div[data-testid="stMetric"] {
                 background: var(--secondary-background-color);
-                border: 1px solid rgba(128,128,128,0.25);
-                padding: 0.8rem 1rem;
-                border-radius: 14px;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                padding: 0.95rem 1rem;
+                border-radius: 16px;
+                box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
             }
             div[data-testid="stMetric"] label,
             div[data-testid="stMetric"] [data-testid="stMetricLabel"],
@@ -549,30 +755,56 @@ def render_header():
             div[data-testid="stMetric"] [data-testid="stMetricDelta"],
             div[data-testid="stMetric"] * {
                 color: var(--text-color) !important;
+                opacity: 1 !important;
             }
             .filter-note, .period-banner {
-                padding: 0.9rem 1rem;
+                padding: 0.95rem 1rem;
                 border-radius: 14px;
-                margin-bottom: 0.75rem;
+                margin-bottom: 0.85rem;
                 color: var(--text-color);
                 border: 1px solid rgba(59, 130, 246, 0.22);
                 background: color-mix(in srgb, var(--secondary-background-color) 90%, #2563eb 10%);
             }
+            .period-banner {
+                white-space: normal !important;
+                overflow-wrap: anywhere;
+            }
             .period-banner strong {
                 font-size: 1rem;
             }
+            .section-title {
+                font-size: 1.05rem;
+                font-weight: 700;
+                margin: 0.2rem 0 0.65rem 0;
+            }
             div[data-baseweb="select"] > div,
             div[data-baseweb="input"] > div,
-            .stTextInput > div > div > input {
+            .stTextInput > div > div > input,
+            .stDateInput input {
                 color: var(--text-color) !important;
+            }
+            .stTabs [data-baseweb="tab-list"] {
+                gap: 0.25rem;
             }
             .stTabs [data-baseweb="tab-list"] button {
                 color: var(--text-color);
+                border-radius: 12px;
             }
         </style>
-        <div class="main-card">
-            <h1 style="margin:0; font-size:2rem;">Analyse RDF Flams</h1>
-            <div class="subtle">Import des personnes + plusieurs rapports HTML, filtres par date, recherche par note, tableau de bord, export Excel et rapport PDF.</div>
+        <div class="hero-card">
+            <div class="hero-flex">
+                <div class="hero-logo">RDF</div>
+                <div>
+                    <h1 class="hero-title">Analyse RDF Flams</h1>
+                    <div class="hero-subtle">
+                        Dashboard multi-fichiers HTML avec contrôle des remises RDF, ROI, graphiques, export Excel et rapport PDF complet.
+                    </div>
+                    <span class="hero-chip">Multi HTML</span>
+                    <span class="hero-chip">PDF avec graphiques</span>
+                    <span class="hero-chip">Contrôle Excel + HTML</span>
+                    <span class="hero-chip">Accès protégé</span>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -617,10 +849,23 @@ def render_overview(df_people, df_tickets, df_discounts):
 
 
 def main():
-    st.set_page_config(page_title="Analyse RDF Flams", layout="wide")
+    st.set_page_config(page_title="Analyse RDF Flams", layout="wide", page_icon="📊")
+    check_password()
     render_header()
 
     with st.sidebar:
+        st.markdown(
+            """
+            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">
+                <div style="width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#2563eb,#7c3aed);display:flex;align-items:center;justify-content:center;color:white;font-weight:800;">RDF</div>
+                <div>
+                    <div style="font-weight:700;">Dashboard RDF</div>
+                    <div style="font-size:0.85rem;opacity:0.8;">Importe les fichiers puis exporte le rapport.</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.header("Imports")
         people_file = st.file_uploader(
             "Fichier personnes",
@@ -633,6 +878,12 @@ def main():
             accept_multiple_files=True,
         )
         st.markdown("---")
+        if st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "")).strip():
+            st.success("Accès protégé actif")
+            if st.button("Se déconnecter", use_container_width=True):
+                st.session_state["authenticated"] = False
+                st.rerun()
+            st.markdown("---")
         st.markdown("**Remises suivies**")
         for reason in TARGET_REASONS:
             st.write(f"• {reason}")
@@ -840,6 +1091,7 @@ def main():
             discount_summary=discount_summary,
             reconciliation=reconciliation,
             selected_sources=selected_sources,
+            daily_lot=daily_lot,
         )
         st.download_button(
             "Extraire un rapport PDF",
